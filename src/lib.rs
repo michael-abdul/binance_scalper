@@ -160,8 +160,10 @@ impl ScalperEngine {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
 
-        // Spawn WebSocket stream; returns the receiver end
-        let rx = websocket::start_stream(&[&symbol_lower]);
+        // Spawn WebSocket stream from inside the runtime context.
+        let rx = self.runtime.block_on(async {
+            websocket::start_stream(&[&symbol_lower])
+        });
 
         let mut guard = self.tick_rx.write();
         *guard = Some(rx);

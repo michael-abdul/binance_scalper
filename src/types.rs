@@ -135,6 +135,9 @@ pub enum ScalperError {
     #[error("REST request: {0}")]
     Rest(#[from] reqwest::Error),
 
+    #[error("REST API: {0}")]
+    RestApi(String),
+
     #[error("JSON parse: {0}")]
     Json(#[from] serde_json::Error),
 

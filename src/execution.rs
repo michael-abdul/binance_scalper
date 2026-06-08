@@ -54,7 +54,7 @@ struct AccountBalance {
     asset: String,
     #[serde(rename = "availableBalance")]
     available_balance: String,
-    #[serde(rename = "unrealizedProfit")]
+    #[serde(rename = "unrealizedProfit", alias = "crossUnPnl", default)]
     unrealized_profit: String,
 }
 
@@ -100,8 +100,17 @@ impl ExecutionEngine {
 
         let url = format!("{}/fapi/v1/exchangeInfo", BASE_URL);
         let resp = self.client.get(&url).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
 
-        let info: ExchangeInfo = resp.json().await?;
+        if !status.is_success() {
+            return Err(ScalperError::RestApi(format!(
+                "exchangeInfo failed HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let info: ExchangeInfo = serde_json::from_str(&body)?;
 
         let mut map = self.precision.write();
         for sym in &info.symbols {
@@ -165,7 +174,21 @@ impl ExecutionEngine {
             .send()
             .await?;
 
-        let balances: Vec<AccountBalance> = resp.json().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(ScalperError::RestApi(format!(
+                "balance failed HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let balances: Vec<AccountBalance> = serde_json::from_str(&body)
+            .map_err(|e| ScalperError::RestApi(format!(
+                "balance decode failed: {} | body: {}",
+                e, body
+            )))?;
 
         let mut w = self.wallet.write();
         for b in &balances {
