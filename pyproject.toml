@@ -1,0 +1,33 @@
+[build-system]
+requires      = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "binance-scalper"
+version         = "0.1.0"
+description     = "Binance Futures Tick Scalper — Rust/PyO3 hybrid"
+requires-python = ">=3.9"
+readme          = "README.md"
+license         = { text = "MIT" }
+
+# Runtime Python dependencies
+dependencies = [
+    # No heavy deps — strategy math uses only stdlib
+    # Add numpy here if you migrate indicator math later:
+    # "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "maturin>=1.5",
+    "pytest>=7.0",
+    "pytest-asyncio",
+]
+
+[tool.maturin]
+# Points maturin at the Rust crate root
+manifest-path = "Cargo.toml"
+python-source = "python"
+module-name   = "binance_scalper"
+# Stable ABI wheel — works across CPython 3.8+ without recompile
+features      = ["pyo3/abi3-py38"]

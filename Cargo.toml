@@ -1,0 +1,75 @@
+[package]
+name        = "binance_scalper"
+version     = "0.1.0"
+edition     = "2021"
+description = "Binance Futures Tick Scalper — Rust core (PyO3 bridge)"
+
+# ── Build output: cdylib  → Python-importable .so / .pyd ──────────
+[lib]
+name    = "binance_scalper"
+crate-type = ["cdylib", "rlib"]   # cdylib for Python, rlib for internal tests
+
+# ── Runtime dependencies ──────────────────────────────────────────
+[dependencies]
+
+# PyO3: Rust ↔ Python FFI bridge (matches maturin build system)
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+
+# Async runtime — single multi-threaded executor
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket transport (async, backed by tokio)
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+
+# HTTP client for signed REST calls (async, rustls TLS)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# JSON serialization / deserialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# URL building for WebSocket combined streams
+url = "2"
+
+# HMAC-SHA256 for Binance request signing
+hmac       = "0.12"
+sha2       = "0.10"
+hex        = "0.4"
+
+# Timestamp (unix millis) without libc call overhead
+chrono = { version = "0.4", features = ["std"] }
+
+# Lock-free thread-safe containers
+parking_lot = "0.12"     # faster Mutex/RwLock than std
+
+# Bounded async channel — Rust → Python tick queue
+tokio-channel = { package = "tokio", version = "1" }   # re-use tokio's channels
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling ergonomics
+anyhow  = "1"
+thiserror = "1"
+
+# futures utilities (StreamExt, SinkExt)
+futures-util = "0.3"
+
+# ── Dev/test dependencies ─────────────────────────────────────────
+[dev-dependencies]
+tokio-test = "0.4"
+
+# ── Release profile: maximum performance ─────────────────────────
+[profile.release]
+opt-level     = 3
+lto           = true     # link-time optimisation across crates
+codegen-units = 1        # single unit → better inlining
+panic         = "abort"  # no unwinding overhead
+strip         = true     # remove debug symbols from .so
+
+# ── Maturin build configuration ──────────────────────────────────
+# Run: maturin develop  (dev)  OR  maturin build --release  (prod)
+[package.metadata.maturin]
+python-source = "python"
+module-name   = "binance_scalper"
