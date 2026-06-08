@@ -19,10 +19,6 @@ use serde::{Deserialize, Serialize};
 // }
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookTickerRaw {
-    #[serde(rename = "u")]
-    pub update_id: u64,
-    #[serde(rename = "s")]
-    pub symbol: String,
     #[serde(rename = "b")]
     pub bid_price: String,
     #[serde(rename = "B")]
@@ -60,7 +56,6 @@ impl Tick {
 // ── Precision rules read from Binance exchange info ──────────
 #[derive(Debug, Clone)]
 pub struct PrecisionRules {
-    pub symbol: String,
     pub price_precision: u32,   // decimal places for price
     pub qty_precision: u32,     // decimal places for quantity
     pub tick_size: f64,         // minimum price increment
@@ -103,14 +98,6 @@ impl Side {
     }
 }
 
-// ── Signal returned by Python brain to Rust hands ────────────
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Signal {
-    Buy,
-    Sell,
-    Hold,
-}
-
 // ── Binance REST order response (subset) ─────────────────────
 #[derive(Debug, Deserialize)]
 pub struct OrderResponse {
@@ -122,8 +109,12 @@ pub struct OrderResponse {
     pub orig_qty: String,
     #[serde(rename = "executedQty")]
     pub executed_qty: String,
-    #[serde(rename = "avgPrice")]
+    // avgPrice bo'sh string yoki "0" kelishi mumkin GTX orderlarda
+    #[serde(rename = "avgPrice", default)]
     pub avg_price: String,
+    // Fallback: agar avgPrice="0" bo'lsa, price fieldidan olamiz
+    #[serde(default)]
+    pub price: String,
 }
 
 // ── Error taxonomy ────────────────────────────────────────────
@@ -149,7 +140,4 @@ pub enum ScalperError {
 
     #[error("Rate limit exceeded")]
     RateLimit,
-
-    #[error("Channel closed")]
-    ChannelClosed,
 }

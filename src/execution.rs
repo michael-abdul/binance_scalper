@@ -58,6 +58,17 @@ struct AccountBalance {
     unrealized_profit: String,
 }
 
+#[derive(serde::Deserialize, Debug)]
+struct OrderStatusResponse {
+    status: String,
+    #[serde(rename = "executedQty", default)]
+    executed_qty: String,
+    #[serde(rename = "avgPrice", default)]
+    avg_price: String,
+    #[serde(default)]
+    price: String,
+}
+
 // ── Main execution engine ─────────────────────────────────────
 
 pub struct ExecutionEngine {
@@ -147,7 +158,6 @@ impl ExecutionEngine {
             }
 
             map.insert(sym.symbol.clone(), PrecisionRules {
-                symbol:          sym.symbol.clone(),
                 price_precision: sym.price_precision,
                 qty_precision:   sym.quantity_precision,
                 tick_size,
@@ -221,7 +231,7 @@ impl ExecutionEngine {
         self.limiter.check_order().map_err(|_| ScalperError::RateLimit)?;
 
         // Normalise price and quantity against exchange rules
-        let (norm_price, norm_qty) = {
+        let (norm_price, norm_qty, min_notional) = {
             let map = self.precision.read();
             let rules = map.get(symbol)
                 .ok_or_else(|| ScalperError::MissingPrecision(symbol.to_string()))?;
@@ -229,8 +239,18 @@ impl ExecutionEngine {
             (
                 normalize_price(raw_price, rules.tick_size, rules.price_precision),
                 normalize_qty(raw_qty, rules.step_size, rules.qty_precision),
+                rules.min_notional,
             )
         };
+
+        let notional = norm_price.parse::<f64>().unwrap_or(0.0)
+            * norm_qty.parse::<f64>().unwrap_or(0.0);
+        if notional < min_notional {
+            return Err(ScalperError::OrderRejected(format!(
+                "Notional too small: {:.8} < min_notional {:.8}",
+                notional, min_notional
+            )));
+        }
 
         debug!(
             "[Exec] {} {} {} @ {} (raw: {} @ {})",
@@ -264,10 +284,16 @@ impl ExecutionEngine {
         let status = resp.status();
         let body = resp.text().await?;
 
-        if status == StatusCode::OK || status == StatusCode::CREATED {
-            let order: OrderResponse = serde_json::from_str(&body)?;
-            info!("[Exec] Order placed: id={} status={}", order.order_id, order.status);
-            Ok(order)
+if status == StatusCode::OK || status == StatusCode::CREATED {
+    let order: OrderResponse = serde_json::from_str(&body)?;
+    info!(
+        "[Exec] Order placed: symbol={} id={} status={} orig_qty={}",
+        order.symbol,
+        order.order_id,
+        order.status,
+        order.orig_qty,
+    );
+    Ok(order)
         } else {
             error!("[Exec] Order rejected HTTP {}: {}", status, body);
             Err(ScalperError::OrderRejected(body))
@@ -299,6 +325,98 @@ impl ExecutionEngine {
             warn!("[Exec] Cancel failed: {}", body);
             Err(ScalperError::OrderRejected(body))
         }
+    }
+
+    /// Query single order status by order ID.
+    pub async fn query_order_status(
+        &self,
+        symbol: &str,
+        order_id: u64,
+    ) -> Result<(String, f64, f64), ScalperError> {
+        self.limiter.check_weight(1).map_err(|_| ScalperError::RateLimit)?;
+
+        let kv = vec![
+            ("symbol", symbol.to_string()),
+            ("orderId", order_id.to_string()),
+        ];
+        let params = self.signed_params_kv(&kv);
+        let url = format!("{}/fapi/v1/order?{}", BASE_URL, params);
+
+        let resp = self.client
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(ScalperError::RestApi(format!(
+                "query_order_status failed HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let order: OrderStatusResponse = serde_json::from_str(&body)?;
+        let executed_qty = order.executed_qty.parse::<f64>().unwrap_or(0.0);
+        let avg_price = {
+            let avg = order.avg_price.parse::<f64>().unwrap_or(0.0);
+            if avg > 0.0 {
+                avg
+            } else {
+                order.price.parse::<f64>().unwrap_or(0.0)
+            }
+        };
+
+        Ok((order.status, executed_qty, avg_price))
+    }
+
+    /// Query current absolute position size for a symbol.
+    pub async fn query_position_size(&self, symbol: &str) -> Result<f64, ScalperError> {
+        self.limiter.check_weight(5).map_err(|_| ScalperError::RateLimit)?;
+
+        let params = self.signed_params(&[("symbol", symbol)]);
+        let url = format!("{}/fapi/v2/positionRisk?{}", BASE_URL, params);
+
+        let resp = self.client
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(ScalperError::RestApi(format!(
+                "query_position_size failed HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+
+        let position_amt_value = match &value {
+            serde_json::Value::Array(arr) => arr
+                .first()
+                .and_then(|v| v.get("positionAmt")),
+            serde_json::Value::Object(_) => value.get("positionAmt"),
+            _ => None,
+        };
+
+        let position_amt = match position_amt_value {
+            Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+            Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+            _ => {
+                return Err(ScalperError::RestApi(format!(
+                    "query_position_size unexpected response shape: {}",
+                    body
+                )));
+            }
+        };
+
+        Ok(position_amt.abs())
     }
 
     // ── HMAC-SHA256 signing ───────────────────────────────────

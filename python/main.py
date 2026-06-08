@@ -65,6 +65,16 @@ POLL_SLEEP  = 0.0
 HEARTBEAT_TICKS = 5_000
 
 
+def is_binance_error(exc: Exception, code: str) -> bool:
+    return code in str(exc)
+
+
+def maker_safe_price(side: str, bid: float, ask: float, tick_size: float) -> float:
+    if side == "BUY":
+        return max(0.0, bid - tick_size)
+    return ask + tick_size
+
+
 def build_strategy() -> TickStrategy:
     """Construct strategy with params matching the MQL5 bot defaults."""
     cfg = StrategyConfig(
@@ -96,6 +106,10 @@ def main() -> None:
     engine = bs.ScalperEngine(SYMBOL, API_KEY, API_SECRET)
     engine.start()    # loads exchange rules, wallet, opens WebSocket
 
+    precision = engine.get_precision()
+    px_rule = precision.get(SYMBOL)
+    tick_size = px_rule[2] if px_rule else 0.1
+
     log.info("Engine started. Waiting for ticks...")
 
     # ── Strategy brain ────────────────────────────────────────────
@@ -106,6 +120,11 @@ def main() -> None:
     open_side:     Optional[str] = None
     open_tp:       float = 0.0
     open_sl:       float = 0.0
+    pending_entry_id: Optional[int] = None
+    pending_side: Optional[str] = None
+    pending_sl: float = 0.0
+    pending_tp: float = 0.0
+    last_close_attempt_ts: float = 0.0
 
     tick_count   = 0
     order_count  = 0
@@ -151,6 +170,33 @@ def main() -> None:
         # ── Position management: check SL/TP manually ─────────────
         # In a production system, rely on exchange-side SL/TP orders.
         # This Python-side check is a backup safety net.
+
+        if pending_entry_id is not None:
+            if tick_count % 5 == 0:
+                try:
+                    status, executed_qty, avg_price = engine.get_order_status(pending_entry_id)
+                    if status in ("FILLED", "PARTIALLY_FILLED") and executed_qty > 0.0:
+                        open_order_id = pending_entry_id
+                        open_side = pending_side
+                        open_sl = pending_sl
+                        open_tp = pending_tp
+                        log.info(
+                            "[ENTRY-FILLED] id=%d status=%s qty=%.6f avg=%.5f",
+                            pending_entry_id,
+                            status,
+                            executed_qty,
+                            avg_price,
+                        )
+                        pending_entry_id = None
+                        pending_side = None
+                    elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+                        log.info("[ENTRY-CLOSED] id=%d status=%s", pending_entry_id, status)
+                        pending_entry_id = None
+                        pending_side = None
+                except Exception as e:
+                    log.debug("Pending order status check failed: %s", e)
+            continue
+
         if open_order_id is not None:
             hit_tp = (open_side == "BUY"  and tick.bid >= open_tp) or \
                      (open_side == "SELL" and tick.ask <= open_tp)
@@ -158,21 +204,34 @@ def main() -> None:
                      (open_side == "SELL" and tick.ask >= open_sl)
 
             if hit_tp or hit_sl:
+                now_ts = time.time()
+                # Avoid hammering close requests on every tick if close fails.
+                if now_ts - last_close_attempt_ts < 0.4:
+                    continue
+
                 close_side  = "SELL" if open_side == "BUY" else "BUY"
                 close_price = tick.bid if close_side == "SELL" else tick.ask
                 outcome     = "TP" if hit_tp else "SL"
+                last_close_attempt_ts = now_ts
 
                 try:
-                    engine.place_order(close_side, LOT_SIZE, close_price, reduce=True)
+                    pos_size = engine.get_position_size()
+                    if pos_size <= 0.0:
+                        log.warning("[%s] No live position on exchange; skipping reduceOnly close", outcome)
+                        open_order_id = None
+                        open_side = None
+                        continue
+
+                    close_qty = min(LOT_SIZE, pos_size)
+                    engine.place_order(close_side, close_qty, close_price, reduce=True)
                     profit = (tick.bid - open_tp) if hit_tp else 0  # rough estimate
                     strategy.risk.on_trade_close(1.0 if hit_tp else -1.0)
                     log.info("[%s] Closed position | side=%s price=%.5f",
                              outcome, close_side, close_price)
+                    open_order_id = None
+                    open_side = None
                 except Exception as e:
                     log.error("Close order failed: %s", e)
-
-                open_order_id = None
-                open_side     = None
             continue  # Don't evaluate new entries while in position
 
         # ── Strategy evaluation (flat only) ──────────────────────
@@ -182,7 +241,7 @@ def main() -> None:
             bid_qty   = tick.bid_qty,
             ask_qty   = tick.ask_qty,
             balance   = last_balance,
-            open_count = 0 if open_order_id is None else 1,
+            open_count = 1 if (open_order_id is not None or pending_entry_id is not None) else 0,
         )
 
         if sig == Signal.HOLD:
@@ -201,20 +260,64 @@ def main() -> None:
                 price  = limit_px,
                 reduce = False,
             )
-            open_order_id = result.order_id
-            open_side     = side_str
-            open_sl       = sl
-            open_tp       = tp
             order_count  += 1
 
-            log.info(
-                "[ENTRY] %s | id=%d | limit=%.5f | SL=%.5f | TP=%.5f | "
-                "spread=%.5f | balance=%.2f",
-                side_str, result.order_id, limit_px, sl, tp,
-                tick.spread, last_balance,
-            )
+            if result.status in ("FILLED", "PARTIALLY_FILLED") and result.executed_qty > 0.0:
+                open_order_id = result.order_id
+                open_side = side_str
+                open_sl = sl
+                open_tp = tp
+                log.info(
+                    "[ENTRY-FILLED] %s | id=%d | limit=%.5f | avg=%.5f | SL=%.5f | TP=%.5f",
+                    side_str, result.order_id, limit_px, result.avg_price, sl, tp,
+                )
+            elif result.status == "NEW":
+                pending_entry_id = result.order_id
+                pending_side = side_str
+                pending_sl = sl
+                pending_tp = tp
+                log.info(
+                    "[ENTRY-PENDING] %s | id=%d | limit=%.5f | SL=%.5f | TP=%.5f",
+                    side_str, result.order_id, limit_px, sl, tp,
+                )
+            else:
+                log.info(
+                    "[ENTRY-ACCEPTED] %s | id=%d | status=%s | limit=%.5f",
+                    side_str, result.order_id, result.status, limit_px,
+                )
         except Exception as e:
-            log.error("Order placement failed: %s", e)
+            if is_binance_error(e, '"code":-5022'):
+                retry_px = maker_safe_price(side_str, tick.bid, tick.ask, tick_size)
+                try:
+                    result = engine.place_order(
+                        side=side_str,
+                        qty=LOT_SIZE,
+                        price=retry_px,
+                        reduce=False,
+                    )
+                    order_count += 1
+                    if result.status in ("FILLED", "PARTIALLY_FILLED") and result.executed_qty > 0.0:
+                        open_order_id = result.order_id
+                        open_side = side_str
+                        open_sl = sl
+                        open_tp = tp
+                        log.info(
+                            "[ENTRY-RETRY-FILLED] %s | id=%d | retry_limit=%.5f | avg=%.5f",
+                            side_str, result.order_id, retry_px, result.avg_price,
+                        )
+                    else:
+                        pending_entry_id = result.order_id
+                        pending_side = side_str
+                        pending_sl = sl
+                        pending_tp = tp
+                        log.info(
+                            "[ENTRY-RETRY-PENDING] %s | id=%d | retry_limit=%.5f | status=%s",
+                            side_str, result.order_id, retry_px, result.status,
+                        )
+                except Exception as retry_e:
+                    log.error("Order placement failed after maker retry: %s", retry_e)
+            else:
+                log.error("Order placement failed: %s", e)
 
     # ── Shutdown summary ──────────────────────────────────────────
     log.info(

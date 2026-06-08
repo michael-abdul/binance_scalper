@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 use execution::ExecutionEngine;
 use rate_limiter::RateLimiter;
-use types::{PositionState, ScalperError, Side, Tick};
+use types::{Side, Tick};
 
 // ── Python-visible Tick struct ────────────────────────────────
 // Mirrors `types::Tick` but implements IntoPy so pyo3 can
@@ -239,11 +239,16 @@ impl ScalperEngine {
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
-        .map(|r| PyOrderResult {
+        .map(|r| {
+            let avg_price = r.avg_price.parse::<f64>().unwrap_or(0.0);
+            let fallback_price = r.price.parse::<f64>().unwrap_or(0.0);
+
+            PyOrderResult {
             order_id:     r.order_id,
             status:       r.status,
             executed_qty: r.executed_qty.parse().unwrap_or(0.0),
-            avg_price:    r.avg_price.parse().unwrap_or(0.0),
+            avg_price:    if avg_price > 0.0 { avg_price } else { fallback_price },
+            }
         })
     }
 
@@ -254,6 +259,30 @@ impl ScalperEngine {
 
         self.runtime.block_on(async {
             exec.cancel_order(&symbol, order_id)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Query order status by order ID.
+    pub fn get_order_status(&self, order_id: u64) -> PyResult<(String, f64, f64)> {
+        let symbol = self.symbol.clone();
+        let exec   = Arc::clone(&self.exec);
+
+        self.runtime.block_on(async {
+            exec.query_order_status(&symbol, order_id)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Query current absolute position size for the configured symbol.
+    pub fn get_position_size(&self) -> PyResult<f64> {
+        let symbol = self.symbol.clone();
+        let exec   = Arc::clone(&self.exec);
+
+        self.runtime.block_on(async {
+            exec.query_position_size(&symbol)
                 .await
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
@@ -274,6 +303,25 @@ impl ScalperEngine {
         let map = self.exec.precision.read();
         Ok(map.iter().map(|(k, v)| {
             (k.clone(), (v.price_precision, v.qty_precision, v.tick_size, v.step_size))
+        }).collect())
+    }
+
+    /// Return cached open positions as a Python dict.
+    pub fn get_positions(&self) -> PyResult<HashMap<String, (String, String, f64, f64, f64, f64, i64)>> {
+        let map = self.exec.positions.read();
+        Ok(map.iter().map(|(k, p)| {
+            (
+                k.clone(),
+                (
+                    p.symbol.clone(),
+                    p.side.as_str().to_string(),
+                    p.size,
+                    p.entry_price,
+                    p.stop_loss,
+                    p.take_profit,
+                    p.open_ts_ms,
+                ),
+            )
         }).collect())
     }
 }
