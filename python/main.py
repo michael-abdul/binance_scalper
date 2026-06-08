@@ -13,7 +13,8 @@ Usage:
   export BINANCE_SECRET="..."
   python main.py
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import sys
 import time

@@ -28,7 +28,7 @@ use crate::types::{
 
 type HmacSha256 = Hmac<Sha256>;
 
-const BASE_URL: &str = "https://fapi.binance.com";
+const BASE_URL: &str = "https://testnet.binancefuture.com";
 const RECV_WINDOW_MS: u64 = 5000; // tolerance for clock skew
 
 // ── Exchange info response shapes ────────────────────────────
