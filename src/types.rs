@@ -58,18 +58,6 @@ pub struct WalletState {
     pub unrealised_pnl: f64,
 }
 
-// ── Open position snapshot ───────────────────────────────────
-#[derive(Debug, Clone)]
-pub struct PositionState {
-    pub symbol:      String,
-    pub side:        Side,
-    pub size:        f64,
-    pub entry_price: f64,
-    pub stop_loss:   f64,
-    pub take_profit: f64,
-    pub open_ts_ms:  i64,
-}
-
 // ── Order direction ──────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
@@ -95,8 +83,6 @@ pub struct OrderResponse {
     pub status: String,
     #[serde(rename = "type", default)]
     pub order_type: String,
-    #[serde(rename = "origQty")]
-    pub orig_qty: String,
     #[serde(rename = "executedQty")]
     pub executed_qty: String,
     #[serde(rename = "avgPrice", default)]
@@ -110,25 +96,16 @@ pub struct OrderResponse {
 pub enum ScalperError {
     #[error("WebSocket: {0}")]
     WebSocket(String),
-
     #[error("REST request: {0}")]
     Rest(#[from] reqwest::Error),
-
     #[error("REST API: {0}")]
     RestApi(String),
-
     #[error("JSON parse: {0}")]
     Json(#[from] serde_json::Error),
-
     #[error("Precision rule missing for symbol {0}")]
     MissingPrecision(String),
-
     #[error("Order rejected: {0}")]
     OrderRejected(String),
-
     #[error("Rate limit exceeded")]
     RateLimit,
-
-    #[error("Channel closed")]
-    ChannelClosed,
 }

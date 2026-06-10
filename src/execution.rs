@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::rate_limiter::RateLimiter;
 use crate::types::{
-    OrderResponse, PositionState, PrecisionRules,
+    OrderResponse, PrecisionRules,
     ScalperError, Side, WalletState,
 };
 
@@ -78,7 +78,6 @@ pub struct ExecutionEngine {
     limiter:   Arc<RateLimiter>,
 
     pub wallet:    Arc<RwLock<WalletState>>,
-    pub positions: Arc<RwLock<HashMap<String, PositionState>>>,
     pub precision: Arc<RwLock<HashMap<String, PrecisionRules>>>,
 }
 
@@ -97,7 +96,6 @@ impl ExecutionEngine {
             secret,
             limiter,
             wallet:    Arc::new(RwLock::new(WalletState::default())),
-            positions: Arc::new(RwLock::new(HashMap::new())),
             precision: Arc::new(RwLock::new(HashMap::new())),
         }
     }

@@ -134,16 +134,23 @@ def maker_safe_price(side: str, bid: float, ask: float, tick_size: float) -> flo
     return max(0.0, bid - tick_size) if side == "BUY" else ask + tick_size
 
 
-def build_strategy() -> TickStrategy:
+# ── Dynamic thresholds — % of price, works for any coin ──────  # ← NEW
+DEFAULT_SPREAD_PCT   = 0.0008   # 0.08% → BTC≈50, ETH≈1.3, SOL≈0.05
+DEFAULT_MIN_MOVE_PCT = 0.0002   # 0.02%
+DEFAULT_SL_PCT       = 0.0025   # 0.25%
+DEFAULT_TP_PCT       = 0.0015   # 0.15%
+
+def build_strategy(ref_price: float) -> TickStrategy:   # ← CHANGED
+    p = max(ref_price, 0.01)
     cfg = StrategyConfig(
-        ema_fast_period=5,
-        ema_slow_period=20,
-        max_spread=0.60,
-        min_move=0.10,
-        velocity_window=1,
-        sl_dist=1.50,
-        tp_dist=1.00,
-        spread_sl_mult=1.5,
+        ema_fast_period = 5,
+        ema_slow_period = 20,
+        max_spread      = round(p * DEFAULT_SPREAD_PCT,   8),         # ← CHANGED
+        min_move        = round(p * DEFAULT_MIN_MOVE_PCT, 8),         # ← CHANGED
+        velocity_window = 1,
+        sl_dist         = round(p * DEFAULT_SL_PCT,       8),         # ← CHANGED
+        tp_dist         = round(p * DEFAULT_TP_PCT,       8),         # ← CHANGED
+        spread_sl_mult  = 1.5,
     )
     risk = RiskState(
         max_consec_losses=6,
@@ -309,6 +316,85 @@ def _place_entry(
     _register_entry_result(state, result, side_str, limit_px, entry, log)
 
 
+# ── Tick processor (DRY — used for first tick + main loop) ───  # ← NEW
+def _process_tick(
+    tick:      "bs.PyTick",
+    engine:    "bs.ScalperEngine",
+    state:     SymbolState,
+    strategy:  TickStrategy,
+    tick_size: float,
+    log:       logging.Logger,
+) -> None:
+    state.tick_count += 1
+
+    if state.tick_count % BALANCE_REFRESH_EVERY == 0:
+        _refresh_balance(engine, state, log)
+
+    if state.tick_count % HEARTBEAT_TICKS == 0:
+        log.info("Heartbeat | ticks=%d orders=%d balance=%.2f | "
+                 "bid=%.5f ask=%.5f spread=%.5f",
+                 state.tick_count, state.order_count, state.last_balance,
+                 tick.bid, tick.ask, tick.spread)
+
+    if state.pending is not None:
+        if state.tick_count % PENDING_POLL_EVERY == 0:
+            _poll_pending(engine, state, log)
+        return
+
+    if state.position is not None:
+        _manage_open_position(engine, state, strategy, tick, log)
+        return
+
+    entry = strategy.evaluate(
+        bid        = tick.bid,
+        ask        = tick.ask,
+        balance    = state.last_balance,
+        open_count = state.open_count,
+    )
+    if entry.signal == Signal.HOLD:
+        return
+
+    side_str = "BUY" if entry.signal == Signal.BUY else "SELL"
+    limit_px = tick.bid if entry.signal == Signal.BUY else tick.ask
+    _place_entry(engine, state, side_str, limit_px, entry, tick_size, tick, log)
+
+
+# ── Per-symbol loop ───────────────────────────────────────────
+# ── NEW: extracted helpers ────────────────────────────────────
+
+def _wait_for_first_tick(
+    symbol:     str,
+    engine:     "bs.ScalperEngine",
+    stop_event: threading.Event,
+) -> Optional["bs.PyTick"]:
+    while not stop_event.is_set():
+        t = engine.poll_tick()
+        if t is not None and t.symbol == symbol:
+            return t
+        time.sleep(0.01)
+    return None
+
+
+def _run_tick_loop(
+    symbol:     str,
+    engine:     "bs.ScalperEngine",
+    state:      SymbolState,
+    strategy:   TickStrategy,
+    tick_size:  float,
+    stop_event: threading.Event,
+    log:        logging.Logger,
+) -> None:
+    while not stop_event.is_set():
+        tick: Optional[bs.PyTick] = engine.poll_tick()
+        if tick is None:
+            if POLL_SLEEP > 0:
+                time.sleep(POLL_SLEEP)
+            continue
+        if tick.symbol != symbol:
+            continue
+        _process_tick(tick, engine, state, strategy, tick_size, log)
+
+
 # ── Per-symbol loop ───────────────────────────────────────────
 
 def run_symbol(symbol: str, stop_event: threading.Event) -> None:
@@ -324,63 +410,25 @@ def run_symbol(symbol: str, stop_event: threading.Event) -> None:
     precision = engine.get_precision()
     px_rule   = precision.get(symbol)
     tick_size = px_rule[2] if px_rule else 0.1
-    log.info("Engine ready | tick_size=%.4f | Rust v%s", tick_size, bs.__version__)
 
-    strategy = build_strategy()
+    first_tick = _wait_for_first_tick(symbol, engine, stop_event)
+    if first_tick is None:
+        return
+
+    strategy = build_strategy(first_tick.mid)
     state    = SymbolState(symbol=symbol, lot_size=get_lot(symbol))
 
-    while not stop_event.is_set():
-        tick: Optional[bs.PyTick] = engine.poll_tick()
+    log.info("Engine ready | tick_size=%.4f | ref_price=%.5f | "
+             "max_spread=%.5f | min_move=%.5f | sl=%.5f | tp=%.5f | Rust v%s",
+             tick_size, first_tick.mid,
+             strategy.cfg.max_spread, strategy.cfg.min_move,
+             strategy.cfg.sl_dist,    strategy.cfg.tp_dist,
+             bs.__version__)
 
-        if tick is None:
-            if POLL_SLEEP > 0:
-                time.sleep(POLL_SLEEP)
-            continue
-
-        # Route: only process ticks belonging to this thread's symbol
-        if tick.symbol != symbol:
-            continue
-
-        state.tick_count += 1
-
-        if state.tick_count % BALANCE_REFRESH_EVERY == 0:
-            _refresh_balance(engine, state, log)
-
-        if state.tick_count % HEARTBEAT_TICKS == 0:
-            log.info("Heartbeat | ticks=%d orders=%d balance=%.2f | "
-                     "bid=%.5f ask=%.5f spread=%.5f",
-                     state.tick_count, state.order_count, state.last_balance,
-                     tick.bid, tick.ask, tick.spread)
-
-        # ── Pending: poll fill ────────────────────────────────
-        if state.pending is not None:
-            if state.tick_count % PENDING_POLL_EVERY == 0:
-                _poll_pending(engine, state, log)
-            continue
-
-        # ── Open position: SL/TP ──────────────────────────────
-        if state.position is not None:
-            _manage_open_position(engine, state, strategy, tick, log)
-            continue
-
-        # ── Flat: strategy ────────────────────────────────────
-        entry = strategy.evaluate(
-            bid        = tick.bid,
-            ask        = tick.ask,
-            balance    = state.last_balance,
-            open_count = state.open_count,
-        )
-
-        if entry.signal == Signal.HOLD:
-            continue
-
-        side_str = "BUY" if entry.signal == Signal.BUY else "SELL"
-        limit_px = tick.bid if entry.signal == Signal.BUY else tick.ask
-
-        _place_entry(engine, state, side_str, limit_px, entry, tick_size, tick, log)
+    _process_tick(first_tick, engine, state, strategy, tick_size, log)
+    _run_tick_loop(symbol, engine, state, strategy, tick_size, stop_event, log)
 
     log.info("Stopped | ticks=%d orders=%d", state.tick_count, state.order_count)
-
 
 # ── Main ──────────────────────────────────────────────────────
 
