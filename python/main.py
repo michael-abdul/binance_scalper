@@ -1,329 +1,423 @@
 """
-main.py — Binance Futures Tick Scalper Entry Point
-====================================================
+main.py — Binance Futures Tick Scalper (Multi-Symbol)
+======================================================
 Architecture:
-  Rust WebSocket  ──→  tick channel  ──→  Python strategy loop
-                                               │
-                                         Signal/SL/TP
-                                               │
-                                      Rust REST execution
+  ONE shared ScalperEngine (one WS connection, one rate limiter)
+    Rust WebSocket  ──→  tick channel  ──→  Python strategy loop
+                                                 │
+                                           EntryResult (signal/sl/tp)
+                                                 │
+                              LIMIT(entry) / MARKET(close) REST
+
+Multi-symbol via threads — each symbol runs an independent
+TickStrategy in its own daemon thread, routing ticks by symbol.
 
 Usage:
-  export BINANCE_API_KEY="..."
-  export BINANCE_SECRET="..."
-  python main.py
+  SCALPER_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT python main.py
+  SCALPER_SYMBOL=BTCUSDT python main.py          # single (backwards compat)
 """
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import sys
 import time
 import signal
 import logging
+import threading
+from dataclasses import dataclass, field
 from typing import Optional
 
-# ── Local strategy brain ──────────────────────────────────────────
-from strategy import (
-    Signal, TickStrategy, StrategyConfig,
-    RiskState,
-)
+from strategy import Signal, TickStrategy, StrategyConfig, RiskState, EntryResult
 
-# ── Rust compiled extension (built with: maturin develop) ─────────
 try:
-    import binance_scalper as bs          # compiled .so / .pyd
+    import binance_scalper as bs
 except ImportError:
     sys.exit(
         "ERROR: binance_scalper native module not found.\n"
         "Build it with:  maturin develop --release"
     )
 
-# ── Logging ───────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("scalper")
+
+# ── Global config ─────────────────────────────────────────────
+API_KEY    = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_SECRET", "")
+
+# Multi-symbol: comma-separated, e.g. "BTCUSDT,ETHUSDT,SOLUSDT"
+_sym_env = os.getenv("SCALPER_SYMBOLS") or os.getenv("SCALPER_SYMBOL", "BTCUSDT")
+SYMBOLS  = [s.strip().upper() for s in _sym_env.split(",") if s.strip()]
+
+# Per-symbol lot sizes: "BTCUSDT=0.001,ETHUSDT=0.01" or single SCALPER_LOT
+_lot_default = float(os.getenv("SCALPER_LOT", "0.001"))
+_lot_env     = os.getenv("SCALPER_LOTS", "")
+LOT_MAP: dict[str, float] = {}
+if _lot_env:
+    for part in _lot_env.split(","):
+        if "=" in part:
+            sym, val = part.split("=", 1)
+            LOT_MAP[sym.strip().upper()] = float(val.strip())
+
+def get_lot(symbol: str) -> float:
+    return LOT_MAP.get(symbol, _lot_default)
+
+POLL_SLEEP            = float(os.getenv("SCALPER_POLL_SLEEP",      "0.0"))
+HEARTBEAT_TICKS       = int(os.getenv("SCALPER_HEARTBEAT",         "5000"))
+PENDING_POLL_EVERY    = int(os.getenv("SCALPER_PENDING_POLL",       "3"))
+BALANCE_REFRESH_EVERY = int(os.getenv("SCALPER_BALANCE_REFRESH",    "200"))
+CLOSE_RETRY_COOLDOWN  = float(os.getenv("SCALPER_CLOSE_COOLDOWN",  "0.4"))
+MAX_CLOSE_RETRIES     = int(os.getenv("SCALPER_MAX_CLOSE_RETRIES",  "3"))
+
+# ── Shared engine (one WS + one rate limiter for all symbols) ─
+_engine:      Optional["bs.ScalperEngine"] = None
+_engine_lock: threading.Lock = threading.Lock()
+
+def get_or_create_engine() -> "bs.ScalperEngine":
+    global _engine
+    with _engine_lock:
+        if _engine is None:
+            _engine = bs.ScalperEngine(SYMBOLS, API_KEY, API_SECRET)
+            _engine.start(SYMBOLS)
+        return _engine
+
+# ── Position state ────────────────────────────────────────────
+
+@dataclass
+class PositionState:
+    order_id:    int
+    side:        str
+    sl:          float
+    tp:          float
+    close_tries: int = 0
 
 
-# ── Configuration constants ───────────────────────────────────────
-SYMBOL      = os.getenv("SCALPER_SYMBOL",  "BTCUSDT")
-API_KEY     = os.getenv("BINANCE_API_KEY",  "")
-API_SECRET  = os.getenv("BINANCE_SECRET",   "")
-
-# Lot size in base asset (e.g. 0.001 BTC)
-# Actual qty sent to Binance will be normalised to stepSize.
-LOT_SIZE    = float(os.getenv("SCALPER_LOT", "0.001"))
-
-# Polling interval when no ticks are buffered (seconds)
-# Keep at 0 for minimal latency; increase to ~0.001 to reduce
-# CPU usage on slower VPS at the cost of ~1 ms added latency.
-POLL_SLEEP  = 0.0
-
-# Maximum number of consecutive HOLD ticks before printing a
-# heartbeat log (avoids silent-running confusion).
-HEARTBEAT_TICKS = 5_000
+@dataclass
+class PendingState:
+    order_id: int
+    side:     str
+    sl:       float
+    tp:       float
 
 
-def is_binance_error(exc: Exception, code: str) -> bool:
+@dataclass
+class SymbolState:
+    symbol:                str
+    lot_size:              float
+    position:              Optional[PositionState] = None
+    pending:               Optional[PendingState]  = None
+    last_close_attempt_ts: float                   = field(default=0.0)
+    tick_count:            int                     = field(default=0)
+    order_count:           int                     = field(default=0)
+    last_balance:          float                   = field(default=0.0)
+
+    @property
+    def is_flat(self) -> bool:
+        return self.position is None and self.pending is None
+
+    @property
+    def open_count(self) -> int:
+        return 0 if self.is_flat else 1
+
+
+# ── Helpers ───────────────────────────────────────────────────
+
+def is_binance_code(exc: Exception, code: str) -> bool:
     return code in str(exc)
 
 
 def maker_safe_price(side: str, bid: float, ask: float, tick_size: float) -> float:
-    if side == "BUY":
-        return max(0.0, bid - tick_size)
-    return ask + tick_size
+    return max(0.0, bid - tick_size) if side == "BUY" else ask + tick_size
 
 
 def build_strategy() -> TickStrategy:
-    """Construct strategy with params matching the MQL5 bot defaults."""
     cfg = StrategyConfig(
-        ema_fast_period = 5,
-        ema_slow_period = 20,
-        max_spread      = 0.60,    # ~60 pts at BTC point=0.01
-        min_move        = 0.10,
-        velocity_window = 1,
-        sl_dist         = 1.50,
-        tp_dist         = 1.00,
-        spread_sl_mult  = 1.5,
+        ema_fast_period=5,
+        ema_slow_period=20,
+        max_spread=0.60,
+        min_move=0.10,
+        velocity_window=1,
+        sl_dist=1.50,
+        tp_dist=1.00,
+        spread_sl_mult=1.5,
     )
     risk = RiskState(
-        max_consec_losses = 6,
-        daily_dd_pct      = 3.0,
-        max_open_orders   = 1,
+        max_consec_losses=6,
+        daily_dd_pct=3.0,
+        max_open_orders=1,
     )
     return TickStrategy(cfg, risk)
 
 
-def main() -> None:
-    if not API_KEY or not API_SECRET:
-        sys.exit("ERROR: Set BINANCE_API_KEY and BINANCE_SECRET environment variables")
+# ── Sub-handlers ──────────────────────────────────────────────
 
-    log.info("Starting Binance Futures Tick Scalper — symbol=%s lot=%.4f", SYMBOL, LOT_SIZE)
-    log.info("Rust engine version: %s", bs.__version__)
+def _refresh_balance(
+    engine: "bs.ScalperEngine", state: SymbolState, log: logging.Logger
+) -> None:
+    try:
+        state.last_balance = engine.get_balance()
+    except Exception:
+        log.exception("Balance fetch failed")
 
-    # ── Initialise Rust engine ────────────────────────────────────
-    engine = bs.ScalperEngine(SYMBOL, API_KEY, API_SECRET)
-    engine.start()    # loads exchange rules, wallet, opens WebSocket
+
+def _poll_pending(
+    engine: "bs.ScalperEngine", state: SymbolState, log: logging.Logger
+) -> None:
+    assert state.pending is not None
+    p = state.pending
+    try:
+        status, executed_qty, avg_price = engine.get_order_status(state.symbol, p.order_id)
+    except Exception:
+        log.exception("Pending status check failed id=%d", p.order_id)
+        return
+
+    if status in ("FILLED", "PARTIALLY_FILLED") and executed_qty > 0.0:
+        state.position = PositionState(p.order_id, p.side, p.sl, p.tp)
+        state.pending  = None
+        log.info("[ENTRY-FILLED] id=%d status=%s qty=%.6f avg=%.5f",
+                 p.order_id, status, executed_qty, avg_price)
+    elif status in ("CANCELED", "EXPIRED", "REJECTED"):
+        log.info("[ENTRY-DEAD] id=%d status=%s", p.order_id, status)
+        state.pending = None
+
+
+def _check_sl_tp(tick: "bs.PyTick", pos: PositionState) -> tuple[bool, bool]:
+    if pos.side == "BUY":
+        return tick.bid >= pos.tp, tick.bid <= pos.sl
+    return tick.ask <= pos.tp, tick.ask >= pos.sl
+
+
+def _close_with_market(
+    engine:   "bs.ScalperEngine",
+    state:    SymbolState,
+    strategy: TickStrategy,
+    tick:     "bs.PyTick",
+    outcome:  str,
+    log:      logging.Logger,
+) -> None:
+    """MARKET close — guaranteed fill. Never uses GTX/POST_ONLY."""
+    assert state.position is not None
+    pos        = state.position
+    close_side = "SELL" if pos.side == "BUY" else "BUY"
+
+    try:
+        pos_size = engine.get_position_size(state.symbol)
+    except Exception:
+        log.exception("[%s] get_position_size failed", outcome)
+        return
+
+    if pos_size <= 0.0:
+        log.warning("[%s] No live position on exchange — clearing state", outcome)
+        state.position = None
+        return
+
+    close_qty    = min(state.lot_size, pos_size)
+    pos.close_tries += 1
+
+    try:
+        engine.place_market_order(state.symbol, close_side, close_qty, reduce=True)
+    except Exception:
+        log.exception("[%s] MARKET close failed (attempt %d/%d)",
+                      outcome, pos.close_tries, MAX_CLOSE_RETRIES)
+        if pos.close_tries >= MAX_CLOSE_RETRIES:
+            log.error("[%s] Max retries hit — clearing state. "
+                      "CHECK EXCHANGE MANUALLY!", outcome)
+            state.position = None
+        return
+
+    strategy.risk.on_trade_close(is_win=(outcome == "TP"))
+    log.info("[%s] MARKET close sent | side=%s qty=%.6f | bid=%.5f ask=%.5f",
+             outcome, close_side, close_qty, tick.bid, tick.ask)
+    state.position = None
+
+
+def _manage_open_position(
+    engine:   "bs.ScalperEngine",
+    state:    SymbolState,
+    strategy: TickStrategy,
+    tick:     "bs.PyTick",
+    log:      logging.Logger,
+) -> None:
+    assert state.position is not None
+    hit_tp, hit_sl = _check_sl_tp(tick, state.position)
+    if not (hit_tp or hit_sl):
+        return
+    now = time.time()
+    if now - state.last_close_attempt_ts < CLOSE_RETRY_COOLDOWN:
+        return
+    state.last_close_attempt_ts = now
+    _close_with_market(engine, state, strategy, tick,
+                       "TP" if hit_tp else "SL", log)
+
+
+def _register_entry_result(
+    state:    SymbolState,
+    result:   "bs.PyOrderResult",
+    side_str: str,
+    limit_px: float,
+    entry:    EntryResult,
+    log:      logging.Logger,
+) -> None:
+    if result.status in ("FILLED", "PARTIALLY_FILLED") and result.executed_qty > 0.0:
+        state.position = PositionState(result.order_id, side_str,
+                                       entry.sl_price, entry.tp_price)
+        log.info("[ENTRY-FILLED] %s | id=%d | limit=%.5f | avg=%.5f | SL=%.5f | TP=%.5f",
+                 side_str, result.order_id, limit_px,
+                 result.avg_price, entry.sl_price, entry.tp_price)
+    else:
+        state.pending = PendingState(result.order_id, side_str,
+                                     entry.sl_price, entry.tp_price)
+        log.info("[ENTRY-PENDING] %s | id=%d | limit=%.5f | SL=%.5f | TP=%.5f | status=%s",
+                 side_str, result.order_id, limit_px,
+                 entry.sl_price, entry.tp_price, result.status)
+
+
+def _place_entry(
+    engine:    "bs.ScalperEngine",
+    state:     SymbolState,
+    side_str:  str,
+    limit_px:  float,
+    entry:     EntryResult,
+    tick_size: float,
+    tick:      "bs.PyTick",
+    log:       logging.Logger,
+) -> None:
+    try:
+        result = engine.place_order(state.symbol, side_str, state.lot_size, limit_px, reduce=False)
+    except Exception as exc:
+        if is_binance_code(exc, '"code":-5022'):
+            # Price crossed spread — retry one tick deeper as maker
+            retry_px = maker_safe_price(side_str, tick.bid, tick.ask, tick_size)
+            try:
+                result = engine.place_order(state.symbol, side_str, state.lot_size, retry_px, reduce=False)
+            except Exception:
+                log.exception("LIMIT retry failed after -5022")
+                return
+            state.order_count += 1
+            _register_entry_result(state, result, side_str, retry_px, entry, log)
+            log.info("[ENTRY-RETRY] %s retry_px=%.5f status=%s",
+                     side_str, retry_px, result.status)
+        else:
+            log.exception("Order placement failed")
+        return
+
+    state.order_count += 1
+    _register_entry_result(state, result, side_str, limit_px, entry, log)
+
+
+# ── Per-symbol loop ───────────────────────────────────────────
+
+def run_symbol(symbol: str, stop_event: threading.Event) -> None:
+    log = logging.getLogger(f"scalper.{symbol}")
+    log.info("Starting | lot=%.4f", get_lot(symbol))
+
+    try:
+        engine = get_or_create_engine()
+    except Exception:
+        log.exception("Engine start failed — thread exiting")
+        return
 
     precision = engine.get_precision()
-    px_rule = precision.get(SYMBOL)
+    px_rule   = precision.get(symbol)
     tick_size = px_rule[2] if px_rule else 0.1
+    log.info("Engine ready | tick_size=%.4f | Rust v%s", tick_size, bs.__version__)
 
-    log.info("Engine started. Waiting for ticks...")
-
-    # ── Strategy brain ────────────────────────────────────────────
     strategy = build_strategy()
+    state    = SymbolState(symbol=symbol, lot_size=get_lot(symbol))
 
-    # ── Live state ────────────────────────────────────────────────
-    open_order_id: Optional[int] = None   # None when flat
-    open_side:     Optional[str] = None
-    open_tp:       float = 0.0
-    open_sl:       float = 0.0
-    pending_entry_id: Optional[int] = None
-    pending_side: Optional[str] = None
-    pending_sl: float = 0.0
-    pending_tp: float = 0.0
-    last_close_attempt_ts: float = 0.0
-
-    tick_count   = 0
-    order_count  = 0
-    last_balance = 0.0
-
-    # ── Graceful shutdown ─────────────────────────────────────────
-    running = True
-    def _shutdown(sig, frame):
-        nonlocal running
-        log.info("Shutdown signal received — stopping loop")
-        running = False
-    signal.signal(signal.SIGINT,  _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # ── Main tick loop ────────────────────────────────────────────
-    while running:
+    while not stop_event.is_set():
         tick: Optional[bs.PyTick] = engine.poll_tick()
 
         if tick is None:
-            # No tick available — yield briefly or spin
             if POLL_SLEEP > 0:
                 time.sleep(POLL_SLEEP)
             continue
 
-        tick_count += 1
-
-        # ── Periodic balance refresh (every 200 ticks) ────────────
-        if tick_count % 200 == 0:
-            try:
-                last_balance = engine.get_balance()
-            except Exception as e:
-                log.warning("Balance fetch failed: %s", e)
-
-        # ── Heartbeat log ─────────────────────────────────────────
-        if tick_count % HEARTBEAT_TICKS == 0:
-            log.info(
-                "Heartbeat | ticks=%d orders=%d balance=%.2f USDT | "
-                "bid=%.5f ask=%.5f spread=%.5f",
-                tick_count, order_count, last_balance,
-                tick.bid, tick.ask, tick.spread,
-            )
-
-        # ── Position management: check SL/TP manually ─────────────
-        # In a production system, rely on exchange-side SL/TP orders.
-        # This Python-side check is a backup safety net.
-
-        if pending_entry_id is not None:
-            if tick_count % 5 == 0:
-                try:
-                    status, executed_qty, avg_price = engine.get_order_status(pending_entry_id)
-                    if status in ("FILLED", "PARTIALLY_FILLED") and executed_qty > 0.0:
-                        open_order_id = pending_entry_id
-                        open_side = pending_side
-                        open_sl = pending_sl
-                        open_tp = pending_tp
-                        log.info(
-                            "[ENTRY-FILLED] id=%d status=%s qty=%.6f avg=%.5f",
-                            pending_entry_id,
-                            status,
-                            executed_qty,
-                            avg_price,
-                        )
-                        pending_entry_id = None
-                        pending_side = None
-                    elif status in ("CANCELED", "EXPIRED", "REJECTED"):
-                        log.info("[ENTRY-CLOSED] id=%d status=%s", pending_entry_id, status)
-                        pending_entry_id = None
-                        pending_side = None
-                except Exception as e:
-                    log.debug("Pending order status check failed: %s", e)
+        # Route: only process ticks belonging to this thread's symbol
+        if tick.symbol != symbol:
             continue
 
-        if open_order_id is not None:
-            hit_tp = (open_side == "BUY"  and tick.bid >= open_tp) or \
-                     (open_side == "SELL" and tick.ask <= open_tp)
-            hit_sl = (open_side == "BUY"  and tick.bid <= open_sl) or \
-                     (open_side == "SELL" and tick.ask >= open_sl)
+        state.tick_count += 1
 
-            if hit_tp or hit_sl:
-                now_ts = time.time()
-                # Avoid hammering close requests on every tick if close fails.
-                if now_ts - last_close_attempt_ts < 0.4:
-                    continue
+        if state.tick_count % BALANCE_REFRESH_EVERY == 0:
+            _refresh_balance(engine, state, log)
 
-                close_side  = "SELL" if open_side == "BUY" else "BUY"
-                close_price = tick.bid if close_side == "SELL" else tick.ask
-                outcome     = "TP" if hit_tp else "SL"
-                last_close_attempt_ts = now_ts
+        if state.tick_count % HEARTBEAT_TICKS == 0:
+            log.info("Heartbeat | ticks=%d orders=%d balance=%.2f | "
+                     "bid=%.5f ask=%.5f spread=%.5f",
+                     state.tick_count, state.order_count, state.last_balance,
+                     tick.bid, tick.ask, tick.spread)
 
-                try:
-                    pos_size = engine.get_position_size()
-                    if pos_size <= 0.0:
-                        log.warning("[%s] No live position on exchange; skipping reduceOnly close", outcome)
-                        open_order_id = None
-                        open_side = None
-                        continue
+        # ── Pending: poll fill ────────────────────────────────
+        if state.pending is not None:
+            if state.tick_count % PENDING_POLL_EVERY == 0:
+                _poll_pending(engine, state, log)
+            continue
 
-                    close_qty = min(LOT_SIZE, pos_size)
-                    engine.place_order(close_side, close_qty, close_price, reduce=True)
-                    profit = (tick.bid - open_tp) if hit_tp else 0  # rough estimate
-                    strategy.risk.on_trade_close(1.0 if hit_tp else -1.0)
-                    log.info("[%s] Closed position | side=%s price=%.5f",
-                             outcome, close_side, close_price)
-                    open_order_id = None
-                    open_side = None
-                except Exception as e:
-                    log.error("Close order failed: %s", e)
-            continue  # Don't evaluate new entries while in position
+        # ── Open position: SL/TP ──────────────────────────────
+        if state.position is not None:
+            _manage_open_position(engine, state, strategy, tick, log)
+            continue
 
-        # ── Strategy evaluation (flat only) ──────────────────────
-        sig, sl, tp = strategy.evaluate(
-            bid       = tick.bid,
-            ask       = tick.ask,
-            bid_qty   = tick.bid_qty,
-            ask_qty   = tick.ask_qty,
-            balance   = last_balance,
-            open_count = 1 if (open_order_id is not None or pending_entry_id is not None) else 0,
+        # ── Flat: strategy ────────────────────────────────────
+        entry = strategy.evaluate(
+            bid        = tick.bid,
+            ask        = tick.ask,
+            balance    = state.last_balance,
+            open_count = state.open_count,
         )
 
-        if sig == Signal.HOLD:
+        if entry.signal == Signal.HOLD:
             continue
 
-        # ── Execute entry order ───────────────────────────────────
-        side_str  = "BUY" if sig == Signal.BUY else "SELL"
-        # For LIMIT POST_ONLY: queue at bid (buy) or ask (sell)
-        # to act as maker and capture lower fee tier.
-        limit_px  = tick.bid if sig == Signal.BUY else tick.ask
+        side_str = "BUY" if entry.signal == Signal.BUY else "SELL"
+        limit_px = tick.bid if entry.signal == Signal.BUY else tick.ask
 
-        try:
-            result = engine.place_order(
-                side   = side_str,
-                qty    = LOT_SIZE,
-                price  = limit_px,
-                reduce = False,
-            )
-            order_count  += 1
+        _place_entry(engine, state, side_str, limit_px, entry, tick_size, tick, log)
 
-            if result.status in ("FILLED", "PARTIALLY_FILLED") and result.executed_qty > 0.0:
-                open_order_id = result.order_id
-                open_side = side_str
-                open_sl = sl
-                open_tp = tp
-                log.info(
-                    "[ENTRY-FILLED] %s | id=%d | limit=%.5f | avg=%.5f | SL=%.5f | TP=%.5f",
-                    side_str, result.order_id, limit_px, result.avg_price, sl, tp,
-                )
-            elif result.status == "NEW":
-                pending_entry_id = result.order_id
-                pending_side = side_str
-                pending_sl = sl
-                pending_tp = tp
-                log.info(
-                    "[ENTRY-PENDING] %s | id=%d | limit=%.5f | SL=%.5f | TP=%.5f",
-                    side_str, result.order_id, limit_px, sl, tp,
-                )
-            else:
-                log.info(
-                    "[ENTRY-ACCEPTED] %s | id=%d | status=%s | limit=%.5f",
-                    side_str, result.order_id, result.status, limit_px,
-                )
-        except Exception as e:
-            if is_binance_error(e, '"code":-5022'):
-                retry_px = maker_safe_price(side_str, tick.bid, tick.ask, tick_size)
-                try:
-                    result = engine.place_order(
-                        side=side_str,
-                        qty=LOT_SIZE,
-                        price=retry_px,
-                        reduce=False,
-                    )
-                    order_count += 1
-                    if result.status in ("FILLED", "PARTIALLY_FILLED") and result.executed_qty > 0.0:
-                        open_order_id = result.order_id
-                        open_side = side_str
-                        open_sl = sl
-                        open_tp = tp
-                        log.info(
-                            "[ENTRY-RETRY-FILLED] %s | id=%d | retry_limit=%.5f | avg=%.5f",
-                            side_str, result.order_id, retry_px, result.avg_price,
-                        )
-                    else:
-                        pending_entry_id = result.order_id
-                        pending_side = side_str
-                        pending_sl = sl
-                        pending_tp = tp
-                        log.info(
-                            "[ENTRY-RETRY-PENDING] %s | id=%d | retry_limit=%.5f | status=%s",
-                            side_str, result.order_id, retry_px, result.status,
-                        )
-                except Exception as retry_e:
-                    log.error("Order placement failed after maker retry: %s", retry_e)
-            else:
-                log.error("Order placement failed: %s", e)
+    log.info("Stopped | ticks=%d orders=%d", state.tick_count, state.order_count)
 
-    # ── Shutdown summary ──────────────────────────────────────────
-    log.info(
-        "Stopped. Total ticks processed: %d | Total orders: %d",
-        tick_count, order_count,
-    )
+
+# ── Main ──────────────────────────────────────────────────────
+
+def main() -> None:
+    if not API_KEY or not API_SECRET:
+        sys.exit("ERROR: Set BINANCE_API_KEY and BINANCE_SECRET env vars")
+
+    if not SYMBOLS:
+        sys.exit("ERROR: Set SCALPER_SYMBOLS=BTCUSDT,ETHUSDT or SCALPER_SYMBOL=BTCUSDT")
+
+    root_log = logging.getLogger("scalper")
+    root_log.info("Launching %d symbol(s): %s", len(SYMBOLS), ", ".join(SYMBOLS))
+
+    stop_event = threading.Event()
+
+    def _shutdown(sig: int, _frame: object) -> None:
+        root_log.info("Shutdown signal — stopping all threads")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    threads: list[threading.Thread] = []
+    for sym in SYMBOLS:
+        t = threading.Thread(
+            target=run_symbol,
+            args=(sym, stop_event),
+            name=f"scalper-{sym}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    root_log.info("All threads stopped.")
 
 
 if __name__ == "__main__":

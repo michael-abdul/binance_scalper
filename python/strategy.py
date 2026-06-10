@@ -3,9 +3,8 @@ strategy.py — Python Brain Layer
 =================================
 Replicates the MQL5 indicator logic exactly:
   • EMA (fast/slow) computed with numpy-free pure float deque
-    (avoids numpy import cost in tight loops)
-  • Spread filter (raw points, identical to InpMaxSpreadPts)
-  • Tick-velocity filter (min move, identical to InpMinMovePts)
+  • Spread filter  (InpMaxSpreadPts)
+  • Tick-velocity filter (InpMinMovePts)
   • M1 trend gate (EMA cross state: bullish / bearish / cross)
   • Micro-pullback detection (replaces MT5 _GetSignal())
   • Risk gate: daily drawdown + consecutive losses
@@ -19,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
 
+
 # ── Signal enum mirrors ENUM_SIGNAL in MQL5 ──────────────────────
 class Signal(IntEnum):
     HOLD =  0
@@ -30,9 +30,9 @@ class Signal(IntEnum):
 class EMA:
     """
     Incremental EMA (identical to iMA / MODE_EMA in MT5).
-    alpha = 2 / (period + 1)  — standard Wilder formula.
+    alpha = 2 / (period + 1) — standard Wilder formula.
     """
-    def __init__(self, period: int):
+    def __init__(self, period: int) -> None:
         self._alpha = 2.0 / (period + 1)
         self._value: Optional[float] = None
 
@@ -41,7 +41,7 @@ class EMA:
             self._value = price
         else:
             self._value = self._alpha * price + (1.0 - self._alpha) * self._value
-        return self._value
+        return self._value  # type: ignore[return-value]
 
     @property
     def value(self) -> Optional[float]:
@@ -54,12 +54,10 @@ class EMA:
 # ── Tick velocity tracker ─────────────────────────────────────────
 class TickVelocity:
     """
-    Tracks the rolling n-tick average mid-price movement.
-    Equivalent to `bidMove = MathAbs(bid - g_lastBid)` in MT5
-    but smoothed over a window to reduce noise.
+    Rolling n-tick average mid-price movement.
+    Equivalent to MathAbs(bid - g_lastBid) in MT5, smoothed over a window.
     """
-    def __init__(self, window: int = 1):
-        self._window = window
+    def __init__(self, window: int = 1) -> None:
         self._moves: deque[float] = deque(maxlen=window)
         self._last_mid: Optional[float] = None
 
@@ -71,14 +69,10 @@ class TickVelocity:
             return 0.0
         return sum(self._moves) / len(self._moves)
 
-    @property
-    def last_move(self) -> float:
-        return self._moves[-1] if self._moves else 0.0
-
 
 # ── Spread EMA (mirrors _UpdateSpreadEma in StrategyModule.mqh) ──
 class SpreadEMA:
-    def __init__(self, period: int = 5):
+    def __init__(self, period: int = 5) -> None:
         self._ema = EMA(period)
 
     def update(self, spread: float) -> float:
@@ -93,13 +87,13 @@ class SpreadEMA:
 @dataclass
 class RiskState:
     max_consec_losses: int   = 6
-    daily_dd_pct:      float = 3.0     # block when daily loss >= 3%
-    max_open_orders:   int   = 1       # scalper: one position at a time
+    daily_dd_pct:      float = 3.0
+    max_open_orders:   int   = 1
     consec_losses:     int   = field(default=0, init=False)
     day_start_balance: float = field(default=0.0, init=False)
-    _last_day: str            = field(default="", init=False)
+    _last_day:         str   = field(default="", init=False)
 
-    def reset_day(self, balance: float):
+    def reset_day(self, balance: float) -> None:
         today = time.strftime("%Y%m%d")
         if today != self._last_day:
             self.day_start_balance = balance
@@ -116,8 +110,8 @@ class RiskState:
                 return False, f"daily_drawdown={dd:.2f}% >= {self.daily_dd_pct}%"
         return True, "ok"
 
-    def on_trade_close(self, profit: float):
-        if profit > 0:
+    def on_trade_close(self, is_win: bool) -> None:
+        if is_win:
             self.consec_losses = 0
         else:
             self.consec_losses += 1
@@ -126,38 +120,74 @@ class RiskState:
 # ── Strategy parameters ───────────────────────────────────────────
 @dataclass
 class StrategyConfig:
-    # EMA periods (M1 timeframe equivalent)
-    ema_fast_period:  int   = 5
-    ema_slow_period:  int   = 20
+    ema_fast_period: int   = 5
+    ema_slow_period: int   = 20
+    max_spread:      float = 0.60
+    min_move:        float = 0.10
+    velocity_window: int   = 1
+    sl_dist:         float = 1.50
+    tp_dist:         float = 1.00
+    spread_sl_mult:  float = 1.5
 
-    # Spread limits (in price units, same as InpMaxSpreadPts * point)
-    max_spread:       float = 0.60   # e.g. 0.60 USDT for BTC/USDT
 
-    # Minimum price movement to trigger entry (anti-noise)
-    min_move:         float = 0.10   # in price units
+# ── Entry result ──────────────────────────────────────────────────
+@dataclass(frozen=True)
+class EntryResult:
+    signal:   Signal
+    sl_price: float
+    tp_price: float
 
-    # Tick velocity: require at least N consecutive moves > min_move
-    velocity_window:  int   = 1
+    @staticmethod
+    def hold() -> "EntryResult":
+        return EntryResult(Signal.HOLD, 0.0, 0.0)
 
-    # SL / TP in price units (mirrors InpSLPoints * point)
-    sl_dist:          float = 1.50
-    tp_dist:          float = 1.00   # maker TP is tighter (lower fee cost)
 
-    # Spread-adaptive entry: widen SL when spread is high
-    spread_sl_mult:   float = 1.5    # SL *= this when spread > max_spread * 0.7
+# ── Helpers (extracted to keep evaluate() complexity low) ─────────
+
+def _compute_sl_tp(
+    signal:     Signal,
+    bid:        float,
+    ask:        float,
+    spread:     float,
+    cfg:        StrategyConfig,
+) -> tuple[float, float]:
+    """Return (sl_price, tp_price) given direction and current quote."""
+    sl_dist = cfg.sl_dist
+    if spread > cfg.max_spread * 0.7:
+        sl_dist *= cfg.spread_sl_mult
+
+    if signal == Signal.BUY:
+        return ask - sl_dist, ask + cfg.tp_dist
+    return bid + sl_dist, bid - cfg.tp_dist
+
+
+def _detect_pullback(
+    new_trend: int,
+    move:      float,
+    min_move:  float,
+) -> Signal:
+    """
+    Micro-pullback entry logic (replaces _GetSignal in MQL5).
+    Bull trend + negative move → BUY the dip.
+    Bear trend + positive move → SELL the rip.
+    """
+    if new_trend == 1 and move < -min_move:
+        return Signal.BUY
+    if new_trend == -1 and move > min_move:
+        return Signal.SELL
+    return Signal.HOLD
 
 
 # ── Main strategy class ───────────────────────────────────────────
 class TickStrategy:
     """
-    Stateful strategy: call `evaluate(tick)` on every tick received
-    from the Rust layer.  Returns (Signal, sl_price, tp_price) or
-    (Signal.HOLD, 0.0, 0.0).
+    Stateful strategy: call evaluate() on every tick from the Rust layer.
+    Returns EntryResult(signal, sl_price, tp_price).
     """
 
-    def __init__(self, cfg: StrategyConfig, risk: RiskState):
-        self.cfg   = cfg
-        self.risk  = risk
+    def __init__(self, cfg: StrategyConfig, risk: RiskState) -> None:
+        self.cfg  = cfg
+        self.risk = risk
 
         self._ema_fast   = EMA(cfg.ema_fast_period)
         self._ema_slow   = EMA(cfg.ema_slow_period)
@@ -165,97 +195,80 @@ class TickStrategy:
         self._spread_ema = SpreadEMA(period=5)
 
         self._last_bid: Optional[float] = None
+        self._trend: int = 0 
 
-        # Trend state: 1=bull, -1=bear, 0=cross/unknown
-        self._trend: int = 0
+    # ── Warm-up check ─────────────────────────────────────────────
+    def _indicators_ready(self) -> bool:
+        return self._ema_fast.warm() and self._ema_slow.warm()
+
+    # ── Trend direction ───────────────────────────────────────────
+    def _update_trend(self, fast: float, slow: float) -> int:
+        if fast > slow:
+            return 1
+        if fast < slow:
+            return -1
+        return 0
+
+    # ── Risk check (collapsed into one call) ──────────────────────
+    def _risk_ok(self, balance: float, open_count: int) -> bool:
+        self.risk.reset_day(balance)
+        approved, _ = self.risk.is_approved(balance, open_count)
+        return approved
 
     # ── Main entry point ──────────────────────────────────────────
     def evaluate(
         self,
-        bid: float,
-        ask: float,
-        bid_qty: float,
-        ask_qty: float,
-        balance: float,
+        bid:        float,
+        ask:        float,
+        balance:    float,
         open_count: int,
-    ) -> tuple[Signal, float, float]:
+    ) -> EntryResult:
         """
-        Returns (Signal, sl_price, tp_price).
-        sl/tp are 0.0 when Signal == HOLD.
+        Returns EntryResult. sl/tp are 0.0 when signal == HOLD.
+
+        NOTE: bid_qty / ask_qty are not used by this strategy version;
+        they remain available via the tick object in main.py if needed
+        for future order-book imbalance filters.
         """
         mid    = (bid + ask) * 0.5
         spread = ask - bid
 
-        # ── Update indicators ─────────────────────────────────────
+        # ── Update all indicators first (always, for warm-up) ─────
         fast_val = self._ema_fast.update(mid)
         slow_val = self._ema_slow.update(mid)
         velocity = self._velocity.update(mid)
-        spread_ema = self._spread_ema.update(spread)
+        self._spread_ema.update(spread)   # maintains internal EMA state
 
-        # Warm-up: need at least slow_period ticks before trading
-        if not (self._ema_fast.warm() and self._ema_slow.warm()):
-            return Signal.HOLD, 0.0, 0.0
+        # ── Gate 1: warm-up ───────────────────────────────────────
+        if not self._indicators_ready():
+            return EntryResult.hold()
 
-        # ── 1. Spread filter (mirrors InpMaxSpreadPts check) ──────
+        # ── Gate 2: spread filter ─────────────────────────────────
         if spread > self.cfg.max_spread:
-            return Signal.HOLD, 0.0, 0.0
+            return EntryResult.hold()
 
-        # ── 2. Risk gate ──────────────────────────────────────────
-        self.risk.reset_day(balance)
-        approved, reason = self.risk.is_approved(balance, open_count)
-        if not approved:
-            return Signal.HOLD, 0.0, 0.0
+        # ── Gate 3: risk ──────────────────────────────────────────
+        if not self._risk_ok(balance, open_count):
+            return EntryResult.hold()
 
-        # ── 3. Tick velocity / min-move filter ────────────────────
+        # ── Gate 4: tick velocity ─────────────────────────────────
         if velocity < self.cfg.min_move:
-            return Signal.HOLD, 0.0, 0.0
+            return EntryResult.hold()
 
-        # ── 4. Trend direction from EMA cross ─────────────────────
-        # Mirrors _GetTrendDir() in TickScalperBot.mq5
-        if fast_val > slow_val:
-            new_trend = 1    # bullish
-        elif fast_val < slow_val:
-            new_trend = -1   # bearish
-        else:
-            new_trend = 0    # at-cross — wait
-
-        cross = (new_trend != self._trend and self._trend != 0)
+        # ── Gate 5: trend direction ───────────────────────────────
+        new_trend  = self._update_trend(fast_val, slow_val)
         self._trend = new_trend
-
         if new_trend == 0:
-            return Signal.HOLD, 0.0, 0.0
+            return EntryResult.hold()
 
-        # ── 5. Micro-pullback entry (replaces _GetSignal) ─────────
-        # Entry only on pullback INTO trend, not on new extensions.
-        # Bull trend + bid just dipped (micro pullback) → BUY
-        # Bear trend + ask just rose  (micro pullback) → SELL
-        move = 0.0 if self._last_bid is None else (bid - self._last_bid)
+        # ── Gate 6: micro-pullback ────────────────────────────────
+        move       = 0.0 if self._last_bid is None else (bid - self._last_bid)
         self._last_bid = bid
-
-        signal = Signal.HOLD
-
-        if new_trend == 1 and move < -self.cfg.min_move:
-            # Pullback in uptrend — buy the dip
-            signal = Signal.BUY
-
-        elif new_trend == -1 and move > self.cfg.min_move:
-            # Rally in downtrend — sell the rip
-            signal = Signal.SELL
+        signal     = _detect_pullback(new_trend, move, self.cfg.min_move)
 
         if signal == Signal.HOLD:
-            return Signal.HOLD, 0.0, 0.0
+            return EntryResult.hold()
 
-        # ── 6. SL / TP calculation ────────────────────────────────
-        sl_dist = self.cfg.sl_dist
-        # Widen SL when spread is elevated (spread-adaptive)
-        if spread > self.cfg.max_spread * 0.7:
-            sl_dist *= self.cfg.spread_sl_mult
-
-        if signal == Signal.BUY:
-            sl    = ask - sl_dist
-            tp    = ask + self.cfg.tp_dist
-        else:  # SELL
-            sl    = bid + sl_dist
-            tp    = bid - self.cfg.tp_dist
-
-        return signal, sl, tp
+        # ── Compute SL / TP ───────────────────────────────────────
+        sl, tp = _compute_sl_tp(signal, bid, ask, spread, self.cfg)
+        return EntryResult(signal, sl, tp)
